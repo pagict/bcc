@@ -11,6 +11,7 @@
 # Licensed under the Apache License, Version 2.0 (the "License")
 # Copyright (C) 2016 Sasha Goldshtein.
 
+from enum import Enum
 from bcc import BPF
 from time import sleep
 from datetime import datetime
@@ -69,6 +70,14 @@ allocations made with kmalloc/kmem_cache_alloc/get_free_pages and corresponding
 memory release functions.
 """
 
+class PrintType(Enum):
+        detail = 'detail'
+        combined = 'combined'
+        final_collapsed = 'final_collapsed'
+
+        def __str__(self):
+                return self.value
+
 parser = argparse.ArgumentParser(description=description,
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=examples)
@@ -86,8 +95,6 @@ parser.add_argument("-o", "--older", default=500, type=int,
         help="prune allocations younger than this age in milliseconds")
 parser.add_argument("-c", "--command",
         help="execute and trace the specified command")
-parser.add_argument("--combined-only", default=False, action="store_true",
-        help="show combined allocation statistics only")
 parser.add_argument("--wa-missing-free", default=False, action="store_true",
         help="Workaround to alleviate misjudgments when free is missing")
 parser.add_argument("-s", "--sample-rate", default=1, type=int,
@@ -104,8 +111,13 @@ parser.add_argument("--ebpf", action="store_true",
         help=argparse.SUPPRESS)
 parser.add_argument("--percpu", default=False, action="store_true",
         help="trace percpu allocations")
+parser.add_argument("--report", type=str, default=PrintType.detail.name,
+        help="report type to print, options can be combined with comma: {{{}}}"
+                .format(','.join([str(x) for x in PrintType])))
 
 args = parser.parse_args()
+
+args.report = args.report.split(',')
 
 pid = args.pid
 command = args.command
@@ -445,7 +457,7 @@ if args.ebpf:
 bpf = BPF(text=bpf_source)
 
 if not kernel_trace:
-        print("Attaching to pid %d, Ctrl+C to quit." % pid)
+        print("Attaching to pid %d, Ctrl+C to quit." % pid, file=sys.stderr)
 
         def attach_probes(sym, fn_prefix=None, can_fail=False):
                 if fn_prefix is None:
@@ -568,12 +580,32 @@ while True:
                 try:
                         sleep(interval)
                 except KeyboardInterrupt:
-                        exit()
-                if args.combined_only:
+                        break
+                if PrintType.combined.name in args.report:
                         print_outstanding_combined()
-                else:
+                if PrintType.detail.name in args.report:
                         print_outstanding()
                 sys.stdout.flush()
                 count_so_far += 1
                 if num_prints is not None and count_so_far >= num_prints:
-                        exit()
+                        break
+
+if PrintType.final_collapsed.name in args.report:
+        def print_stackcollapsed_leaks():
+                stack_traces = bpf["stack_traces"]
+                stacks = bpf["combined_allocs"]
+                for stack_id, info in stacks.items():
+                        try:
+                                trace = []
+                                for addr in stack_traces.walk(stack_id.value):
+                                        sym = bpf.sym(addr, pid,
+                                                        show_module=True,
+                                                        show_offset=True)
+                                        trace.insert(0, sym.decode('utf-8'))
+                                trace = ";".join(trace)
+                        except KeyError:
+                                trace = "stack information lost"
+
+                        print("%s %d" % (trace, info.total_size), flush=True)
+        
+        print_stackcollapsed_leaks()
